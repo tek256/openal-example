@@ -1,4 +1,4 @@
-/*#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -6,242 +6,197 @@
 #include <AL/al.h>
 #include "stb_vorbis.c"
 
-#define MAX_SAMPLE_COUNT 128
-#define SAMPLE_SIZE 16
+#include "test.h"
 
-//4kb max
-#define MAX_FRAME_SIZE 4 * 1024 
+#define MAX_FRAME_SIZE 4096
+#define NUM_BUFFERS 2
+#define PACKETS_PER_BUFFER 16
+#define VORBIS_PACKET_SIZE 256
+#define ROUNDS_PER_PULL 2
+#define BUFFER_SIZE MAX_FRAME_SIZE * PACKETS_PER_BUFFER //* ROUNDS_PER_PULL //* NUM_BUFFERS
 
-static int playing = 0;
-
-//Decode (Use a number of bytes) -> Rebuffer (move unused bytes to front, refill to capacity) -> Loop
-
-typedef struct {
-	//OpenAL resources
-	unsigned int source;
-	unsigned int buffers[2]; 
-	int format; // Mono / Stereo
-
-	short* pcm; // buffered PCM
-	int pcm_limit; // max length of PCM in bytes
-
-	//Vorbis Decoder
-	stb_vorbis* vorbis;
-
-	//Position States (bytes)
-	unsigned int p; // position
-	unsigned int q; // query
-
-	//Raw Data
-	unsigned char* frame; // raw data stored
-	unsigned int frame_size; //  size of data stored
-	unsigned int frame_capacity;
-	unsigned int frame_offset; // offset from start of file
-	unsigned int file_length; // in bytes of overall file
-} stream;
+#define MIN_BUFFER_SIZE VORBIS_PACKET_SIZE * 8
 
 static char* test_file = "res/test.ogg";
 
-unsigned char* request_data(int* file_length, int* length_read, int offset, int requested_length){
-	unsigned char* data;
+static int max_length, offset;
+static unsigned char* data;
 
+static short* pcm;
+static int pcm_capacity;
+
+static int is_playing, has_buffered;
+
+unsigned char* get_data(int* length){
 	FILE* f = fopen(test_file, "r+");
-	
-	assert(f);
+
+	if(!f){
+		printf("Unable to open file: %s\n", test_file);
+		return NULL;
+	}
 
 	fseek(f, 0, SEEK_END);
-	int true_length = ftell(f);
+	int file_length = ftell(f);
+	rewind(f); 
 
-	if(file_length){
-		*file_length = true_length;
-	}
-	
-	if(offset < true_length){
-		fseek(f, offset, SEEK_SET);
-
-		int data_left = true_length - offset;
-		int to_read = (data_left > requested_length) ? requested_length : data_left;
-
-		printf("[%i] : [%i] :: [%i]\n", data_left, offset, to_read);	
-		assert(to_read > 0);	
-
-		data = (unsigned char*)malloc(to_read + 1);
-
-		int actually_read = fread(data, sizeof(char), to_read, f);
-
-		if(length_read){
-			*length_read = actually_read;
-		}
-
-		data[actually_read] = '\0';
-
+	unsigned char* data = (unsigned char*)malloc(file_length * sizeof(char));
+	if(!data){
 		fclose(f);
-
-		return data;
-	}else{
-		printf("Offset is outside of file bounds.\n");
-		fclose(f);
-		*length_read = 0;
-		return 0;
-	}
-}	
-
-void rebuffer(stream* s){
-	if(!s){
-		return;
-	}
-	
-	if(s->frame_offset + s->frame_size >= s->file_length){
-		printf("No data to append for.\n");
-		return;	
-	}
-	
-	int data_read;
-	unsigned char* data_from_file = request_data(NULL, &data_read, s->frame_offset, s->frame_capacity);
-			
-	if(!data_from_file || !data_read){
-		printf("Unable to read data from file.\n");
-		return;
-	}	
-
-	int unused = s->frame_size - s->p;
-	int remainder = s->frame_capacity - (s->p + unused);
-	memcpy(s->frame, s->frame[s->p], unused);
-	
-	int file_cpy_limit = (s->p > data_read) ? data_read : s->p;
-	memcpy(&s->frame[unused], data_from_file, file_cpy_limit);
-
-	s->frame_offset += file_cpy_limit;
-	s->frame_size = file_cpy_limit + unused;
-
-	if(file_cpy_limit < remainder){
-		memset(&s->frame[unused + file_cpy_limit], 0, remainder - file_cpy_limit);
+	   	return NULL;
 	}
 
-	s->p = 0;
+
+	if(length){
+		*length = file_length;
+	}
+
+	fread(data, sizeof(unsigned char), file_length, f);
+	data[file_length] = 0;
+	fclose(f);
+
+	return data;
 }
 
-
-void conv_out(int buf_c, short* buffer, int data_c, float** data, int d_offset, int len){
-	if(!data || !buffer){
-		printf("No data passed.\n");
-		return;
-	}
-
-	int limit = buf_c < data_c ? buf_c : data_c; 
-	int i;
-
-	int buffer_index = 0;
-	for(int j=0;j<len;++j){	
-		//each channel
-		for(i=0;i<limit;++i){
-			buffer[buffer_index + j] = data[i][d_offset+j] * 32767;
-			++buffer_index;
-			//float f = data[j][d_offset+i];
-			//*buffer++ = f * 32767;		
-		}
-		//place nothing into the other channel for the data
-		for( ;i<buf_c;++i){
-			buffer[buffer_index + j] = 0;
-			++buffer_index;		
-		}
-	}
-
-	printf("[%i] shorts converted.\n", buffer_index);
-}
-
-stream init_push(unsigned char* data, int length, int file_length){
-	stream s = (stream){0};
-	s.p = 0;
-	//initialize with whole buffer
-	unsigned int q = MAX_FRAME_SIZE;
-
-	assert(length > 0);
-	unsigned char* frame_data = (unsigned char*)malloc(length);
-	memcpy(frame_data, data, length);
-
-	free(data);
-
-	s.frame = frame_data;
-	s.frame_size = length;
-	s.frame_offset = 0;
-	s.file_length = file_length;
-
-	int used, error, retries;
-retry:
-	s.vorbis = stb_vorbis_open_pushdata(frame_data, length, &used, &error, NULL);
-	if(!s.vorbis){
-		if(error = VORBIS_need_more_data){
-			printf("Not enough data in [%i] to initialize push data API.\n", length);
-		}
-
-		printf("Error: [%i]\n", error);
-		return s;
-	}
-
-	s.format = (s.vorbis->channels) ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
-
-	printf("Started at pushing [%i] resulting in [%i] used.\n", q, used);
-	s.p += used;
-
-	alGenSources(1, &s.source);
-	alGenBuffers(2, &s.buffers);
-
-	alSourcef(s.source, AL_GAIN, 1.f);
-
-	rebuffer(&s);
-
-	return s;	
-}
-
-int push_decode(stream* s){
+int push_data(stb_vorbis* vorbis, unsigned int source, unsigned int buffers[2], f_buffer* buffer){
 	float** out;
-	int num_samples, num_channels, bytes_used; //used in bytes
-	int rebuffered = 0;
-
-retry_decode:
-	bytes_used = stb_vorbis_decode_frame_pushdata(s->vorbis, s->frame + s->p, s->frame_size, &num_channels, &out, &num_samples);
-
-	if(bytes_used == 0){
-		if(rebuffered){
-			printf("Unable to decode any samples from whole frame size: [%i]\n", s->frame_size);
-			return 0;
-		}
-
-		//attempt to rebuffer if the offset is set
-		if(s->p > 0){
-			rebuffer(s);
-			rebuffered = 1;
-			goto retry_decode;
-		}
-
-		//Reach on fail	
-		return 0;	
-	}
-
-	s->p += bytes_used;
-
-	if(num_samples == 0){
-		printf("[%i] bytes used without creating any samples.\n", bytes_used);
-		return 0;
-	}else{
-		printf("[%i] bytes used successfully.\n", bytes_used);
-	}
-
-	s->format = (s->vorbis->channels == 1) ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
+	int num_channels, num_samples, bytes_used;
 	
-	int samples_to_buffer = (MAX_SAMPLE_COUNT > num_samples) ? num_samples : MAX_SAMPLE_COUNT;
-	if(!s->pcm){
-		s->pcm_limit = MAX_SAMPLE_COUNT * s->vorbis->channels * sizeof(short);
-		assert(s->pcm_limit > 0);
-		s->pcm = malloc(s->pcm_limit);
-		memset(s->pcm, 0, s->pcm_limit);	
+	int buffered = 0;
+
+	ALint processed;
+	ALenum state;
+
+	alGetSourcei(source, AL_SOURCE_STATE, &state);
+	alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+
+	if(!is_playing && processed == 0){
+		has_buffered = 0;
+		return -1;
+	}
+	
+	int require_more = 0;
+
+	if(processed > 0){
+		for(int i=0;i<processed;++i){
+			ALuint buffer_id;
+
+			alSourceUnqueueBuffers(source, 1, &buffer_id);
+
+
+			/*if(offset + data_length > max_length){
+				data_length = max_length - offset;
+				if(data_length == 0){
+					is_playing = 0;
+					return -1;
+				}	
+			}*/
+
+			if(buffer->data_length - buffer->data_offset <= MIN_BUFFER_SIZE){
+				int load = load_more(buffer);
+				if(load == -1){
+					has_buffered = 0;
+					return -1;		
+				}
+			}
+	
+			int packets_processed = 0;
+			int pcm_index = 0;
+			int pcm_total_length = 0;	
+			memset(pcm, 0, pcm_capacity);
+			int frame_size;
+			for(int i=0;i<PACKETS_PER_BUFFER;++i){
+				frame_size = (buffer->data_length - buffer->data_offset);	
+				frame_size = (frame_size > MAX_FRAME_SIZE) ? MAX_FRAME_SIZE : frame_size;
+
+				//data limit is = length of buffer - offset
+				bytes_used = stb_vorbis_decode_frame_pushdata(vorbis, buffer->data + buffer->data_offset, frame_size, &num_channels, &out, &num_samples);
+				if(bytes_used == 0){
+					if(buffer->data_offset != 0){
+						int load = load_more(buffer);
+						printf("Refilling buffer.\n");
+						
+						if(load == 1){
+							printf("Reprocessed loaded data.\n");
+							frame_size = (buffer->data_length - buffer->data_offset);	
+							frame_size = (frame_size > MAX_FRAME_SIZE) ? MAX_FRAME_SIZE : frame_size;
+
+							bytes_used = stb_vorbis_decode_frame_pushdata(vorbis, buffer->data + buffer->data_offset, frame_size, &num_channels, &out, &num_samples);
+							if(bytes_used == 0){
+								printf("Unable to process [%i] bytes for samples.\n", buffer->data_length - buffer->data_offset);
+							}
+						}
+
+						printf("Unable to load anymore data.\n");
+						return 0;
+					}
+
+					is_playing = 0;	
+					return -1;
+				}
+
+				buffer->data_offset += bytes_used;
+				if(buffer->data_length - buffer->data_offset <= MIN_BUFFER_SIZE){
+					int load = load_more(buffer);
+					buffer->data_offset = 0;
+					printf("Refilling buffer.\n");
+
+					if(load == 1){
+						printf("Loaded more data.\n");
+					}
+				}
+
+				//offset += bytes_used;
+				if(num_samples > 0){
+					int shorts = num_samples * num_channels;
+					int pcm_length = sizeof(short) * shorts;
+					pcm_total_length += pcm_length;
+					if(pcm_length + pcm_index > pcm_capacity){
+						printf("Uhhh.\n");
+						break;
+					}
+					for(int j=0;j<num_samples;++j){
+						for(int i=0;i<num_channels;++i){
+							pcm[pcm_index] = out[i][j] * 32767;
+							++pcm_index;
+						}
+					}
+
+				}
+				if(require_more){
+					break;
+				}
+			}
+
+			printf("[%i] shorts used.\n", pcm_total_length);
+
+			int format = (num_channels == 1) ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
+			alBufferData(buffer_id, format, pcm, pcm_total_length, vorbis->sample_rate);  
+			alSourceQueueBuffers(source, 1, &buffer_id);
+
+			if(require_more){
+				int load = load_more(buffer);
+				if(load == -1){
+					has_buffered = 0;
+					return -1;		
+				}
+			}
+
+			//printf("Buffered [%i] samples.\n", num_samples);
+
+			++buffered;
+		}
 	}
 
-	//0 since we're not doing any offset for the data conversion	
-	conv_out(s->vorbis->channels, s->pcm, s->vorbis->channels, out, 0, samples_to_buffer);
-		
-	return samples_to_buffer;
+	if(buffered){
+		//printf("[%i] buffered.\n", buffered);
+	}
+
+	if(buffered == NUM_BUFFERS){
+		printf("Restarting stream.\n");
+		alSourcePlay(source);
+	}
+
+	return buffered;
 }
 
 int main(int argc, char** argv){	
@@ -254,56 +209,129 @@ int main(int argc, char** argv){
 		return EXIT_FAILURE;
 	}
 
-	//straight_decode(&source, &buffers[0]);
-	int length, file_length;
-	unsigned char* data = request_data(&file_length, &length, 0, MAX_FRAME_SIZE);	
-	int max_frame = (MAX_FRAME_SIZE > length) ? length : MAX_FRAME_SIZE;
+	static int q, error, used;
+	static stb_vorbis* v;
 
-	stream s = init_push(data, max_frame, file_length); 
-	assert(s.vorbis);
+	f_buffer buffer = (f_buffer){0};
+	buffer.file_path = test_file;
 
-	alListenerf(AL_GAIN, 1.f);
-
-	for(int i=0;i<2;++i){
-		unsigned int buffer_id = s.buffers[i];
-		int samples_buffered = push_decode(&s);
-		alBufferData(buffer_id, s.format, s.pcm, samples_buffered * (SAMPLE_SIZE / 8 * s.vorbis->channels), s.vorbis->sample_rate);
-		alSourceQueueBuffers(s.source, 1, &buffer_id);
+	if(!init_buffer(&buffer, BUFFER_SIZE)){
+		printf("We failed bois.\n");
+		return EXIT_FAILURE;
 	}
-	alSourcePlay(s.source);
-	playing = 1;
+	
+	if(buffer.data_capacity < buffer.file_length){
+		buffer.has_remaining = 1;
+	}
 
-	while(1){
-		ALenum state;
-		ALint proc;
+	printf("[%i] BUFFER_SIZE.\n", BUFFER_SIZE);
 
-		alGetSourcei(s.source, AL_SOURCE_STATE, &state);
-		alGetSourcei(s.source, AL_BUFFERS_PROCESSED, &proc);
+	if(buffer.file_length < BUFFER_SIZE){
+		buffer.has_remaining = 0;	
+	}
 
-		int buffers_processed = 0;
+	//data = get_data(&max_length);
+	printf("[%i] bytes in file.\n", buffer.file_length);
 
-		if(state == AL_STOPPED){
-			playing = 0;
-		}else if(proc > 0){
-			for(int i=0;i<proc;++i){
-				ALuint buffer_id;
-				ALint error;
-				alSourceUnqueueBuffers(s.source, 1, &buffer_id);
-				if(!buffer_id || (error = alGetError()) == AL_INVALID_VALUE){
-					printf("Unable to get buffer from source.\n");
-					continue;
-				}
-				//buffer data
-				int samples_buffered = push_decode(&s);
+	buffer.data_offset = 0;
 
-				//assert(s.pcm);
+	q = 1;
+retry_init:
+	v = stb_vorbis_open_pushdata(buffer.data, buffer.data_length, &used, &error, NULL);
+	if(v == NULL){
+		if(error == VORBIS_need_more_data){
+			q += 1;
+			goto retry_init;
+		}
+		printf("Error: [%i]\n", error);
+		return EXIT_FAILURE;
+	}
 
-				alBufferData(buffer_id, s.format, s.pcm, samples_buffered * (SAMPLE_SIZE / 8 * s.vorbis->channels), s.vorbis->sample_rate);
-				alSourceQueueBuffers(s.source, 1, &buffer_id);
-				++buffers_processed;
+	buffer.data_offset += used;
+	//offset += used;
+	
+	pcm_capacity = sizeof(short) * MAX_FRAME_SIZE * PACKETS_PER_BUFFER;
+	pcm = (short*)malloc(pcm_capacity);
+
+	printf("[%i] bytes used in header.\n", used);
+	printf("[%i] sample rate.\n", v->sample_rate);
+	printf("[%i] PCM capacity.\n", pcm_capacity);
+
+	unsigned int source, buffers[NUM_BUFFERS];
+
+	alGenSources(1, &source);
+	alGenBuffers(NUM_BUFFERS, &buffers);
+
+	alListenerf(AL_GAIN, 0.0f); 
+	alSourcef(source, AL_GAIN, 1.f);
+
+	int compressed_packet = 0;
+
+	int bytes_used, num_channels, num_samples;
+	int data_length = buffer.data_length - buffer.data_offset;
+	float** out;
+	for(int i=0;i<NUM_BUFFERS;++i){
+		unsigned int current_buffer = buffers[i];
+initialize_buffer:
+		bytes_used = stb_vorbis_decode_frame_pushdata(v, buffer.data + buffer.data_offset, data_length, &num_channels, &out, &num_samples);
+
+		if(bytes_used == 0){
+			if(buffer.data_offset != 0){
+				load_more(&buffer);
+				goto initialize_buffer;	
 			}
+			printf("Unable to load samples from data with length of [%i]\n", data_length);	
+			break;
+		}
+
+		//printf("Decoded [%i] samples from [%i] bytes.\n", num_samples, bytes_used);
+		//offset += bytes_used;
+		
+		buffer.data_offset += bytes_used;
+		if(buffer.data_length - buffer.data_offset < MIN_BUFFER_SIZE){
+			int load = load_more(&buffer);
+			if(load == -1){
+				printf("Unable to load more data.\n");
+				return EXIT_FAILURE;
+			}
+		}
+
+		if(num_samples > 0){
+			memset(pcm, 0, pcm_capacity);
+			int shorts = num_samples * num_channels;
+			int pcm_length = sizeof(short) * shorts;
+			if(pcm_length > pcm_capacity){
+				printf("Uhhhh.\n");
+			}
+
+			printf("[%i] shorts used.\n", shorts);
+
+			int pcm_index = 0;	
+
+			//convert float to interleaved short
+			for(int j=0;j<num_samples;++j){
+				for(int i=0;i<num_channels;++i){
+					pcm[pcm_index] = out[i][j] * 32767;
+					++pcm_index;
+				}
+			}
+
+			int format = (num_channels == 1) ? AL_FORMAT_MONO16 : AL_FORMAT_STEREO16;
+			alBufferData(current_buffer, format, pcm, pcm_length, v->sample_rate);  
+			alSourceQueueBuffers(source, 1, &current_buffer);
+		}else{
+			goto initialize_buffer;	
 		}
 	}
 
+	alSourcePlay(source);
+	is_playing = 1;
+	has_buffered = 1;
+	while(is_playing && has_buffered){
+		int processed = push_data(v, source, buffers, &buffer);
+	}
+
+	alcCloseDevice(device);
+	free(pcm);
 	return EXIT_SUCCESS;
-}*/
+}
